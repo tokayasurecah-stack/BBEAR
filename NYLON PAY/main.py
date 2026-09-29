@@ -21,8 +21,6 @@ PLAN_DAYS = 34
 # ============================================================
 # ADMIN AUTH
 # ============================================================
-# Set ADMIN_KEY in Render → Environment (long random string).
-# Clients must send header:  X-Admin-Key: <value>
 ADMIN_KEY = os.getenv("ADMIN_KEY", "")
 
 def require_admin(x_admin_key: Optional[str] = Header(None)):
@@ -33,7 +31,7 @@ def require_admin(x_admin_key: Optional[str] = Header(None)):
 
 
 # ============================================================
-# BASIC ENDPOINTS
+# HELPERS
 # ============================================================
 
 @app.get("/")
@@ -56,7 +54,6 @@ def _finalize_success(db: Session, reference: str) -> Optional[User]:
     user = db.query(User).filter(User.email == entry["email"]).first()
     if not user:
         return None
-    # Idempotency: only extend once per reference
     if user.last_payment_ref == reference:
         return user
 
@@ -70,11 +67,55 @@ def _finalize_success(db: Session, reference: str) -> Optional[User]:
     return user
 
 
+# ============================================================
+# AUTH ENDPOINTS
+# ============================================================
+
+@app.post("/auth/login")
+def auth_login(payload: dict, db: Session = Depends(get_db)):
+    """
+    Pure login endpoint. Verifies credentials and returns a token if the
+    user's subscription is still active. Does NOT start a payment.
+
+    Body: {"email": "...", "password": "..."}
+    """
+    email = (payload.get("email") or "").lower().strip()
+    password = payload.get("password") or ""
+
+    if not email or not password:
+        raise HTTPException(400, "Email and password are required")
+
+    user = db.query(User).filter(User.email == email).first()
+    if not user:
+        raise HTTPException(401, "Wrong email or password")
+
+    if not verify_password(password, user.hashed_password):
+        raise HTTPException(401, "Wrong email or password")
+
+    days = _days_left(user)
+    if days <= 0:
+        # 402 Payment Required — semantic signal that they need to pay
+        raise HTTPException(402, "Subscription expired — please pay to continue")
+
+    token = create_token(user.email, days=days)
+    return {
+        "status": "success",
+        "message": f"Welcome back! {days} days left.",
+        "days_left": days,
+        "access_token": token,
+    }
+
+
 @app.post("/auth/pay", response_model=AuthPaymentResponse)
 def auth_and_pay(payload: AuthPaymentRequest, db: Session = Depends(get_db)):
     """
-    Step 1: Create/verify user, start payment, return 'pending' immediately.
-    Kotlin will then poll /payment/status/{reference}.
+    Signup + pay, or login + pay (if expired).
+
+    Behavior:
+      - New email          → create user, initiate NylonPay
+      - Existing + wrong password → 401
+      - Existing + active subscription → skip payment, return success with token
+      - Existing + expired → initiate NylonPay
     """
     email = payload.email.lower().strip()
     user = db.query(User).filter(User.email == email).first()
@@ -86,12 +127,25 @@ def auth_and_pay(payload: AuthPaymentRequest, db: Session = Depends(get_db)):
             phone=payload.phone,
             hashed_password=hash_password(payload.password),
         )
-        db.add(user); db.commit(); db.refresh(user)
+        db.add(user)
+        db.commit()
+        db.refresh(user)
     else:
         if not verify_password(payload.password, user.hashed_password):
             raise HTTPException(401, "Wrong email or password")
 
-    # ---- INITIATE PAYMENT (non-blocking) ----
+        # ⭐ NEW: active subscription → skip payment entirely
+        days = _days_left(user)
+        if days > 0:
+            token = create_token(user.email, days=days)
+            return AuthPaymentResponse(
+                status="success",
+                message=f"Welcome back! {days} days left.",
+                days_left=days,
+                access_token=token,
+            )
+
+    # ---- INITIATE PAYMENT (new user or expired) ----
     res = initiate(
         amount=payload.amount or 3000,
         phone=payload.phone,
@@ -173,13 +227,16 @@ class GrantDaysRequest(_BaseModel):
 
 
 class SetSubscriptionRequest(_BaseModel):
-    subscription_end: str   # ISO 8601, e.g. "2026-11-15T20:00:00"
+    subscription_end: str
     reason: Optional[str] = None
+
+
+class ResetPasswordRequest(_BaseModel):
+    new_password: str
 
 
 @app.get("/admin/users", dependencies=[Depends(require_admin)])
 def admin_list_users(db: Session = Depends(get_db)):
-    """Same as /debug/users but protected. Good for admin dashboards."""
     users = db.query(User).order_by(User.id).all()
     return [
         {
@@ -201,11 +258,6 @@ def admin_grant_days(
     payload: GrantDaysRequest,
     db: Session = Depends(get_db),
 ):
-    """
-    Add N days to a user's subscription.
-    Use this for users who paid but whose payment was never detected
-    (e.g. payments made before the `payment.wait()` fix).
-    """
     target = email.lower().strip()
     user = db.query(User).filter(User.email == target).first()
     if not user:
@@ -232,10 +284,6 @@ def admin_set_subscription(
     payload: SetSubscriptionRequest,
     db: Session = Depends(get_db),
 ):
-    """
-    Set a user's subscription_end to an exact timestamp.
-    Useful when you want to give a precise expiry, not a relative one.
-    """
     target = email.lower().strip()
     user = db.query(User).filter(User.email == target).first()
     if not user:
@@ -258,9 +306,35 @@ def admin_set_subscription(
     }
 
 
+@app.post("/admin/reset-password/{email}", dependencies=[Depends(require_admin)])
+def admin_reset_password(
+    email: str,
+    payload: ResetPasswordRequest,
+    db: Session = Depends(get_db),
+):
+    """
+    Force-reset a user's password. Keeps subscription_end intact.
+    Useful when a user forgot their password or the stored hash is broken.
+    """
+    target = email.lower().strip()
+    user = db.query(User).filter(User.email == target).first()
+    if not user:
+        raise HTTPException(404, "User not found")
+
+    user.hashed_password = hash_password(payload.new_password)
+    db.commit()
+    db.refresh(user)
+
+    return {
+        "email": user.email,
+        "password_reset": True,
+        "days_left": _days_left(user),
+        "subscription_end": user.subscription_end.isoformat() if user.subscription_end else None,
+    }
+
+
 @app.post("/admin/revoke/{email}", dependencies=[Depends(require_admin)])
 def admin_revoke(email: str, db: Session = Depends(get_db)):
-    """Instantly expire a user's subscription (days_left becomes 0)."""
     target = email.lower().strip()
     user = db.query(User).filter(User.email == target).first()
     if not user:
@@ -272,7 +346,6 @@ def admin_revoke(email: str, db: Session = Depends(get_db)):
 
 @app.delete("/admin/user/{email}", dependencies=[Depends(require_admin)])
 def admin_delete_user(email: str, db: Session = Depends(get_db)):
-    """Delete a user permanently."""
     target = email.lower().strip()
     user = db.query(User).filter(User.email == target).first()
     if not user:
