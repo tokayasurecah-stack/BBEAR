@@ -142,3 +142,45 @@ def me(authorization: Optional[str] = Header(None), db: Session = Depends(get_db
         days_left=_days_left(user),
         subscription_end=user.subscription_end.isoformat() if user.subscription_end else None,
     )
+
+
+# ============================================================
+# ⚠️ DEBUG ENDPOINTS — REMOVE BEFORE PRODUCTION ⚠️
+# ============================================================
+
+@app.get("/debug/users")
+def debug_users(db: Session = Depends(get_db)):
+    """List all users — helps you verify what's actually in the DB."""
+    users = db.query(User).all()
+    return [
+        {
+            "id": u.id,
+            "email": u.email,
+            "phone": u.phone,
+            "hashed_password_prefix": (u.hashed_password or "")[:20],
+            "hashed_password_length": len(u.hashed_password or ""),
+            "subscription_end": u.subscription_end.isoformat() if u.subscription_end else None,
+            "created_at": u.created_at.isoformat() if u.created_at else None,
+        }
+        for u in users
+    ]
+
+
+@app.delete("/debug/user/{email}")
+def debug_delete_user(email: str, db: Session = Depends(get_db)):
+    """Delete one user by email — for cleaning up broken signups."""
+    target = email.lower().strip()
+    user = db.query(User).filter(User.email == target).first()
+    if not user:
+        return {"deleted": False, "reason": "not found", "email": target}
+    db.delete(user)
+    db.commit()
+    return {"deleted": True, "email": target}
+
+
+@app.delete("/debug/all-users")
+def debug_wipe(db: Session = Depends(get_db)):
+    """Nuclear: wipe every user. Use with care."""
+    count = db.query(User).delete()
+    db.commit()
+    return {"deleted": count}
