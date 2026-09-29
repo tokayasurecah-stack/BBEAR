@@ -2,6 +2,7 @@ from fastapi import FastAPI, Depends, HTTPException, Header
 from sqlalchemy.orm import Session
 from datetime import datetime, timedelta
 from typing import Optional
+import os
 
 from database import Base, engine, get_db
 from models import User
@@ -11,11 +12,29 @@ from schemas import (
 )
 from auth import hash_password, verify_password, create_token, decode_token
 from payments import initiate, check_status
+from pydantic import BaseModel as _BaseModel
 
 Base.metadata.create_all(bind=engine)
 app = FastAPI(title="Subscription API")
 PLAN_DAYS = 34
 
+# ============================================================
+# ADMIN AUTH
+# ============================================================
+# Set ADMIN_KEY in Render → Environment (long random string).
+# Clients must send header:  X-Admin-Key: <value>
+ADMIN_KEY = os.getenv("ADMIN_KEY", "")
+
+def require_admin(x_admin_key: Optional[str] = Header(None)):
+    if not ADMIN_KEY:
+        raise HTTPException(500, "ADMIN_KEY not configured on server")
+    if x_admin_key != ADMIN_KEY:
+        raise HTTPException(403, "Forbidden")
+
+
+# ============================================================
+# BASIC ENDPOINTS
+# ============================================================
 
 @app.get("/")
 def health(): return {"ok": True}
@@ -145,12 +164,130 @@ def me(authorization: Optional[str] = Header(None), db: Session = Depends(get_db
 
 
 # ============================================================
+# ADMIN ENDPOINTS — require X-Admin-Key header
+# ============================================================
+
+class GrantDaysRequest(_BaseModel):
+    days: int = PLAN_DAYS
+    reason: Optional[str] = None
+
+
+class SetSubscriptionRequest(_BaseModel):
+    subscription_end: str   # ISO 8601, e.g. "2026-11-15T20:00:00"
+    reason: Optional[str] = None
+
+
+@app.get("/admin/users", dependencies=[Depends(require_admin)])
+def admin_list_users(db: Session = Depends(get_db)):
+    """Same as /debug/users but protected. Good for admin dashboards."""
+    users = db.query(User).order_by(User.id).all()
+    return [
+        {
+            "id": u.id,
+            "email": u.email,
+            "phone": u.phone,
+            "subscription_end": u.subscription_end.isoformat() if u.subscription_end else None,
+            "days_left": _days_left(u),
+            "last_payment_ref": u.last_payment_ref,
+            "created_at": u.created_at.isoformat() if u.created_at else None,
+        }
+        for u in users
+    ]
+
+
+@app.post("/admin/grant-days/{email}", dependencies=[Depends(require_admin)])
+def admin_grant_days(
+    email: str,
+    payload: GrantDaysRequest,
+    db: Session = Depends(get_db),
+):
+    """
+    Add N days to a user's subscription.
+    Use this for users who paid but whose payment was never detected
+    (e.g. payments made before the `payment.wait()` fix).
+    """
+    target = email.lower().strip()
+    user = db.query(User).filter(User.email == target).first()
+    if not user:
+        raise HTTPException(404, "User not found")
+
+    now = datetime.utcnow()
+    base = user.subscription_end if (user.subscription_end and user.subscription_end > now) else now
+    user.subscription_end = base + timedelta(days=payload.days)
+    db.commit()
+    db.refresh(user)
+
+    return {
+        "email": user.email,
+        "days_added": payload.days,
+        "reason": payload.reason,
+        "subscription_end": user.subscription_end.isoformat(),
+        "days_left": _days_left(user),
+    }
+
+
+@app.post("/admin/set-subscription/{email}", dependencies=[Depends(require_admin)])
+def admin_set_subscription(
+    email: str,
+    payload: SetSubscriptionRequest,
+    db: Session = Depends(get_db),
+):
+    """
+    Set a user's subscription_end to an exact timestamp.
+    Useful when you want to give a precise expiry, not a relative one.
+    """
+    target = email.lower().strip()
+    user = db.query(User).filter(User.email == target).first()
+    if not user:
+        raise HTTPException(404, "User not found")
+
+    try:
+        new_end = datetime.fromisoformat(payload.subscription_end)
+    except Exception:
+        raise HTTPException(400, "subscription_end must be ISO 8601, e.g. 2026-11-15T20:00:00")
+
+    user.subscription_end = new_end
+    db.commit()
+    db.refresh(user)
+
+    return {
+        "email": user.email,
+        "subscription_end": user.subscription_end.isoformat(),
+        "days_left": _days_left(user),
+        "reason": payload.reason,
+    }
+
+
+@app.post("/admin/revoke/{email}", dependencies=[Depends(require_admin)])
+def admin_revoke(email: str, db: Session = Depends(get_db)):
+    """Instantly expire a user's subscription (days_left becomes 0)."""
+    target = email.lower().strip()
+    user = db.query(User).filter(User.email == target).first()
+    if not user:
+        raise HTTPException(404, "User not found")
+    user.subscription_end = None
+    db.commit()
+    return {"email": user.email, "revoked": True}
+
+
+@app.delete("/admin/user/{email}", dependencies=[Depends(require_admin)])
+def admin_delete_user(email: str, db: Session = Depends(get_db)):
+    """Delete a user permanently."""
+    target = email.lower().strip()
+    user = db.query(User).filter(User.email == target).first()
+    if not user:
+        return {"deleted": False, "reason": "not found"}
+    db.delete(user)
+    db.commit()
+    return {"deleted": True, "email": target}
+
+
+# ============================================================
 # ⚠️ DEBUG ENDPOINTS — REMOVE BEFORE PRODUCTION ⚠️
 # ============================================================
 
 @app.get("/debug/users")
 def debug_users(db: Session = Depends(get_db)):
-    """List all users — helps you verify what's actually in the DB."""
     users = db.query(User).all()
     return [
         {
@@ -168,7 +305,6 @@ def debug_users(db: Session = Depends(get_db)):
 
 @app.delete("/debug/user/{email}")
 def debug_delete_user(email: str, db: Session = Depends(get_db)):
-    """Delete one user by email — for cleaning up broken signups."""
     target = email.lower().strip()
     user = db.query(User).filter(User.email == target).first()
     if not user:
@@ -180,7 +316,6 @@ def debug_delete_user(email: str, db: Session = Depends(get_db)):
 
 @app.delete("/debug/all-users")
 def debug_wipe(db: Session = Depends(get_db)):
-    """Nuclear: wipe every user. Use with care."""
     count = db.query(User).delete()
     db.commit()
     return {"deleted": count}
