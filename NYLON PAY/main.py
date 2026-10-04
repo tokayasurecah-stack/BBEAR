@@ -1,5 +1,4 @@
 from fastapi import FastAPI, Depends, HTTPException, Header
-from referrals import router as referrals_router
 from sqlalchemy.orm import Session
 from datetime import datetime, timedelta
 from typing import Optional
@@ -14,6 +13,9 @@ from schemas import (
 from auth import hash_password, verify_password, create_token, decode_token
 from payments import initiate, check_status
 from pydantic import BaseModel as _BaseModel
+
+# Referral router
+from referrals import router as referrals_router
 
 Base.metadata.create_all(bind=engine)
 app = FastAPI(title="Subscription API")
@@ -96,7 +98,6 @@ def auth_login(payload: dict, db: Session = Depends(get_db)):
 
     days = _days_left(user)
     if days <= 0:
-        # 402 Payment Required — semantic signal that they need to pay
         raise HTTPException(402, "Subscription expired — please pay to continue")
 
     token = create_token(user.email, days=days)
@@ -136,7 +137,7 @@ def auth_and_pay(payload: AuthPaymentRequest, db: Session = Depends(get_db)):
         if not verify_password(payload.password, user.hashed_password):
             raise HTTPException(401, "Wrong email or password")
 
-        # ⭐ NEW: active subscription → skip payment entirely
+        # Active subscription → skip payment entirely
         days = _days_left(user)
         if days > 0:
             token = create_token(user.email, days=days)
@@ -316,7 +317,6 @@ def admin_reset_password(
 ):
     """
     Force-reset a user's password. Keeps subscription_end intact.
-    Useful when a user forgot their password or the stored hash is broken.
     """
     target = email.lower().strip()
     user = db.query(User).filter(User.email == target).first()
