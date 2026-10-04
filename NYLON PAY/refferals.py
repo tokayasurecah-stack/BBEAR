@@ -8,15 +8,32 @@ from database import get_db
 from models import User, Referral, Wallet
 from schemas import (
     RedeemReferralRequest, RedeemReferralResponse,
-    WalletOut,
+    WalletOut, ReferralHistoryItem,
 )
 from auth import decode_token
 
 router = APIRouter(prefix="/referrals", tags=["referrals"])
 
 REFERRAL_REWARD_UGX = 100
-MIN_ACCOUNT_AGE_MINUTES = 2        # must have existed for at least this long
-MIN_SUBSCRIPTION_DAYS = 1          # must have an active subscription
+MIN_ACCOUNT_AGE_MINUTES = 2
+
+
+# ---------- Helpers (no circular import) ----------
+def _days_left(user: User) -> int:
+    if not user.subscription_end:
+        return 0
+    delta = user.subscription_end - datetime.utcnow()
+    return max(0, delta.days)
+
+
+def _ensure_wallet(db: Session, email: str) -> Wallet:
+    w = db.query(Wallet).filter(Wallet.email == email).first()
+    if not w:
+        w = Wallet(email=email, balance_ugx=0, total_earned_ugx=0)
+        db.add(w)
+        db.commit()
+        db.refresh(w)
+    return w
 
 
 # ---------- Auth dependency ----------
@@ -35,16 +52,6 @@ def get_current_user(
     return user
 
 
-def _ensure_wallet(db: Session, email: str) -> Wallet:
-    w = db.query(Wallet).filter(Wallet.email == email).first()
-    if not w:
-        w = Wallet(email=email, balance_ugx=0, total_earned_ugx=0)
-        db.add(w)
-        db.commit()
-        db.refresh(w)
-    return w
-
-
 # ---------- Endpoints ----------
 
 @router.get("/wallet", response_model=WalletOut)
@@ -52,7 +59,6 @@ def my_wallet(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Return the logged-in user's wallet + how many referrals they've earned from."""
     w = _ensure_wallet(db, user.email)
     count = db.query(func.count(Referral.id)) \
               .filter(Referral.referrer_email == user.email) \
@@ -72,42 +78,38 @@ def redeem_referral(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """
-    Called by the REFERRED user after they've paid.
-    Credits the referrer's wallet with 100 UGX.
-    """
     me = user.email
     referrer_email = payload.referrer_email
 
-    # ---- 1. Can't refer yourself ----
+    # 1. Can't refer yourself
     if referrer_email == me:
         raise HTTPException(400, "You cannot refer yourself")
 
-    # ---- 2. Referred user must have paid (active subscription) ----
-    from main import _days_left   # reuse existing helper
+    # 2. Must have paid
     if _days_left(user) <= 0:
         raise HTTPException(402, "Please subscribe first to earn referral rewards")
 
-    # ---- 3. Anti-fraud: account must be at least N minutes old ----
+    # 3. Account age check (anti-fraud)
     if user.created_at and datetime.utcnow() - user.created_at < timedelta(minutes=MIN_ACCOUNT_AGE_MINUTES):
         raise HTTPException(429, "Please wait a moment before redeeming")
 
-    # ---- 4. This user has never referred anyone before ----
+    # 4. One referral per account, ever
     existing = db.query(Referral).filter(Referral.referred_email == me).first()
     if existing:
         raise HTTPException(409, "You have already redeemed a referral")
 
-    # ---- 5. Referrer must exist ----
+    # 5. Referrer must exist
     referrer = db.query(User).filter(User.email == referrer_email).first()
     if not referrer:
         raise HTTPException(404, "No account found with that email")
 
-    # ---- 6. Credit the referrer ----
+    # 6. Credit the referrer
     wallet = _ensure_wallet(db, referrer_email)
     wallet.balance_ugx += REFERRAL_REWARD_UGX
     wallet.total_earned_ugx += REFERRAL_REWARD_UGX
 
-    # ---- 7. Record the referral (unique constraint blocks double-redeem) ----
+    # 7. Record the referral — the unique constraint on referred_email
+    #    prevents double-redeem even if two requests race.
     ref = Referral(
         referrer_email=referrer_email,
         referred_email=me,
@@ -115,7 +117,11 @@ def redeem_referral(
         note=payload.note,
     )
     db.add(ref)
-    db.commit()
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise HTTPException(409, "Referral already recorded")
 
     return RedeemReferralResponse(
         status="success",
@@ -125,18 +131,16 @@ def redeem_referral(
     )
 
 
-@router.get("/history")
+@router.get("/history", response_model=list[ReferralHistoryItem])
 def my_referral_history(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """List everyone the current user has referred + how much they earned."""
     rows = db.query(Referral) \
              .filter(Referral.referrer_email == user.email) \
              .order_by(Referral.created_at.desc()) \
              .all()
 
-    # Mask the email of referred users for privacy
     def _mask(email: str) -> str:
         try:
             name, domain = email.split("@")
@@ -147,10 +151,10 @@ def my_referral_history(
             return "***"
 
     return [
-        {
-            "referred_email_masked": _mask(r.referred_email),
-            "amount_ugx": r.amount_ugx,
-            "created_at": r.created_at.isoformat(),
-        }
+        ReferralHistoryItem(
+            referred_email_masked=_mask(r.referred_email),
+            amount_ugx=r.amount_ugx,
+            created_at=r.created_at,
+        )
         for r in rows
     ]
