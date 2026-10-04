@@ -1,4 +1,5 @@
 from fastapi import FastAPI, Depends, HTTPException, Header
+from referrals import router as referrals_router
 from sqlalchemy.orm import Session
 from datetime import datetime, timedelta
 from typing import Optional
@@ -16,6 +17,7 @@ from pydantic import BaseModel as _BaseModel
 
 Base.metadata.create_all(bind=engine)
 app = FastAPI(title="Subscription API")
+app.include_router(referrals_router)
 PLAN_DAYS = 34
 
 # ============================================================
