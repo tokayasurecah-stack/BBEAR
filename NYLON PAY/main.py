@@ -33,7 +33,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-# ==
+
 app.include_router(referrals_router)
 app.include_router(withdrawals_router)
 PLAN_DAYS = 34
