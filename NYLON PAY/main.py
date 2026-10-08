@@ -5,7 +5,7 @@ from typing import Optional
 import os
 
 from database import Base, engine, get_db
-from models import User
+from models import User, Wallet, Withdrawal
 from schemas import (
     AuthPaymentRequest, AuthPaymentResponse,
     StatusResponse, MeResponse,
@@ -14,12 +14,14 @@ from auth import hash_password, verify_password, create_token, decode_token
 from payments import initiate, check_status
 from pydantic import BaseModel as _BaseModel
 
-# Referral router
+# Routers
 from referrals import router as referrals_router
+from withdrawals import router as withdrawals_router
 
 Base.metadata.create_all(bind=engine)
 app = FastAPI(title="Subscription API")
 app.include_router(referrals_router)
+app.include_router(withdrawals_router)
 PLAN_DAYS = 34
 
 # ============================================================
@@ -80,8 +82,6 @@ def auth_login(payload: dict, db: Session = Depends(get_db)):
     """
     Pure login endpoint. Verifies credentials and returns a token if the
     user's subscription is still active. Does NOT start a payment.
-
-    Body: {"email": "...", "password": "..."}
     """
     email = (payload.get("email") or "").lower().strip()
     password = payload.get("password") or ""
@@ -113,12 +113,6 @@ def auth_login(payload: dict, db: Session = Depends(get_db)):
 def auth_and_pay(payload: AuthPaymentRequest, db: Session = Depends(get_db)):
     """
     Signup + pay, or login + pay (if expired).
-
-    Behavior:
-      - New email          → create user, initiate NylonPay
-      - Existing + wrong password → 401
-      - Existing + active subscription → skip payment, return success with token
-      - Existing + expired → initiate NylonPay
     """
     email = payload.email.lower().strip()
     user = db.query(User).filter(User.email == email).first()
@@ -148,7 +142,7 @@ def auth_and_pay(payload: AuthPaymentRequest, db: Session = Depends(get_db)):
                 access_token=token,
             )
 
-    # ---- INITIATE PAYMENT (new user or expired) ----
+    # ---- INITIATE PAYMENT ----
     res = initiate(
         amount=payload.amount or 3000,
         phone=payload.phone,
@@ -185,7 +179,6 @@ def payment_status(reference: str, db: Session = Depends(get_db)):
     if s == "failed":
         return StatusResponse(status="failed", message="Payment failed or cancelled")
 
-    # success → extend subscription, mint token
     user = _finalize_success(db, reference)
     if not user:
         return StatusResponse(status="failed", message="Payment OK but user missing")
@@ -237,6 +230,13 @@ class SetSubscriptionRequest(_BaseModel):
 class ResetPasswordRequest(_BaseModel):
     new_password: str
 
+
+class WithdrawalActionRequest(_BaseModel):
+    note: Optional[str] = None
+    external_ref: Optional[str] = None
+
+
+# ---------- Users ----------
 
 @app.get("/admin/users", dependencies=[Depends(require_admin)])
 def admin_list_users(db: Session = Depends(get_db)):
@@ -315,9 +315,6 @@ def admin_reset_password(
     payload: ResetPasswordRequest,
     db: Session = Depends(get_db),
 ):
-    """
-    Force-reset a user's password. Keeps subscription_end intact.
-    """
     target = email.lower().strip()
     user = db.query(User).filter(User.email == target).first()
     if not user:
@@ -355,6 +352,134 @@ def admin_delete_user(email: str, db: Session = Depends(get_db)):
     db.delete(user)
     db.commit()
     return {"deleted": True, "email": target}
+
+
+# ---------- Withdrawals ----------
+
+@app.get("/admin/withdrawals", dependencies=[Depends(require_admin)])
+def admin_list_withdrawals(
+    status: Optional[str] = None,
+    db: Session = Depends(get_db),
+):
+    """List withdrawal requests. Filter with ?status=pending|processing|completed|failed"""
+    q = db.query(Withdrawal)
+    if status:
+        q = q.filter(Withdrawal.status == status)
+    rows = q.order_by(Withdrawal.created_at.desc()).limit(200).all()
+    return [
+        {
+            "id": w.id,
+            "email": w.email,
+            "amount_ugx": w.amount_ugx,
+            "phone": w.phone,
+            "network": w.network,
+            "status": w.status,
+            "reference": w.reference,
+            "note": w.note,
+            "created_at": w.created_at.isoformat() if w.created_at else None,
+            "processed_at": w.processed_at.isoformat() if w.processed_at else None,
+        }
+        for w in rows
+    ]
+
+
+@app.post("/admin/withdrawals/{withdrawal_id}/complete", dependencies=[Depends(require_admin)])
+def admin_complete_withdrawal(
+    withdrawal_id: int,
+    payload: WithdrawalActionRequest,
+    db: Session = Depends(get_db),
+):
+    """Mark a withdrawal as completed after you've sent the money."""
+    w = db.query(Withdrawal).filter(Withdrawal.id == withdrawal_id).first()
+    if not w:
+        raise HTTPException(404, "Withdrawal not found")
+    if w.status == "completed":
+        raise HTTPException(409, "Already completed")
+
+    w.status = "completed"
+    w.processed_at = datetime.utcnow()
+    w.note = payload.note or w.note
+    if payload.external_ref:
+        w.reference = payload.external_ref
+
+    db.commit()
+    return {
+        "id": w.id,
+        "status": w.status,
+        "email": w.email,
+        "amount_ugx": w.amount_ugx,
+        "processed_at": w.processed_at.isoformat(),
+    }
+
+
+@app.post("/admin/withdrawals/{withdrawal_id}/fail", dependencies=[Depends(require_admin)])
+def admin_fail_withdrawal(
+    withdrawal_id: int,
+    payload: WithdrawalActionRequest,
+    db: Session = Depends(get_db),
+):
+    """Mark a withdrawal as failed and REFUND the money to the user's wallet."""
+    w = db.query(Withdrawal).filter(Withdrawal.id == withdrawal_id).first()
+    if not w:
+        raise HTTPException(404, "Withdrawal not found")
+    if w.status in ("completed", "failed"):
+        raise HTTPException(409, f"Withdrawal already {w.status}")
+
+    # Refund the wallet
+    wallet = db.query(Wallet).filter(Wallet.email == w.email).first()
+    if wallet:
+        wallet.balance_ugx += w.amount_ugx
+
+    w.status = "failed"
+    w.processed_at = datetime.utcnow()
+    w.note = payload.note or "Failed — refunded"
+
+    db.commit()
+    return {
+        "id": w.id,
+        "status": w.status,
+        "refunded_ugx": w.amount_ugx,
+        "email": w.email,
+    }
+
+
+@app.post("/admin/withdrawals/process-batch", dependencies=[Depends(require_admin)])
+def admin_process_batch(db: Session = Depends(get_db)):
+    """
+    Send all pending withdrawals at once via NylonPay.
+    Good for weekly payout runs.
+    """
+    from withdrawals import _send_payout_via_nylonpay
+
+    pending = db.query(Withdrawal).filter(Withdrawal.status == "pending").all()
+    results = []
+
+    for w in pending:
+        if w.amount_ugx < 5000:
+            results.append({"id": w.id, "status": "skipped", "reason": "below 5000"})
+            continue
+
+        w.status = "processing"
+        db.commit()
+
+        result = _send_payout_via_nylonpay(w)
+        if result["status"] == "successful":
+            w.status = "completed"
+            w.reference = result.get("reference") or w.reference
+            w.processed_at = datetime.utcnow()
+            results.append({"id": w.id, "status": "completed"})
+        else:
+            wallet = db.query(Wallet).filter(Wallet.email == w.email).first()
+            if wallet:
+                wallet.balance_ugx += w.amount_ugx
+            w.status = "failed"
+            w.note = f"NylonPay: {result.get('raw')}"
+            w.processed_at = datetime.utcnow()
+            results.append({"id": w.id, "status": "failed", "refunded": True})
+
+        db.commit()
+
+    return {"processed": len(results), "results": results}
 
 
 # ============================================================
