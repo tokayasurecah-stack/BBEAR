@@ -34,3 +34,29 @@ class Wallet(Base):
     balance_ugx = Column(BigInteger, default=0)                      # current withdrawable balance
     total_earned_ugx = Column(BigInteger, default=0)                 # lifetime total
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class Withdrawal(Base):
+    """
+    A withdrawal request. When the user submits one, we deduct from their
+    wallet immediately and create this record with status='pending'.
+    Admin then either pays via NylonPay (status='completed') or refunds
+    (status='failed').
+    """
+    __tablename__ = "withdrawals"
+
+    id = Column(Integer, primary_key=True, index=True)
+    email = Column(String, index=True, nullable=False)
+    amount_ugx = Column(Integer, nullable=False)
+    phone = Column(String, nullable=False)                    # normalized: 256XXXXXXXXX
+    network = Column(String, nullable=False)                  # "MTN" | "AIRTEL"
+
+    # statuses: pending | processing | completed | failed
+    status = Column(String, default="pending", index=True, nullable=False)
+
+    reference = Column(String, nullable=True)                 # NylonPay reference
+    note = Column(String, nullable=True)                      # admin note / failure reason
+
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    processed_at = Column(DateTime, nullable=True)
