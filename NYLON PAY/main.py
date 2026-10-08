@@ -1,4 +1,5 @@
 from fastapi import FastAPI, Depends, HTTPException, Header
+from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from datetime import datetime, timedelta
 from typing import Optional
@@ -23,7 +24,18 @@ app = FastAPI(title="Subscription API")
 app.include_router(referrals_router)
 app.include_router(withdrawals_router)
 PLAN_DAYS = 34
-
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "https://bbear-admin.onrender.com",   # your admin site
+        "http://localhost:8000",               # local dev
+        "http://localhost:3000",
+        "http://localhost:5500",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 # ============================================================
 # ADMIN AUTH
 # ============================================================
