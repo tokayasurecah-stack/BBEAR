@@ -21,9 +21,6 @@ from withdrawals import router as withdrawals_router
 
 Base.metadata.create_all(bind=engine)
 app = FastAPI(title="Subscription API")
-app.include_router(referrals_router)
-app.include_router(withdrawals_router)
-PLAN_DAYS = 34
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -36,7 +33,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-# ============================================================
+# ==
+app.include_router(referrals_router)
+app.include_router(withdrawals_router)
+PLAN_DAYS = 34
+==========================================================
 # ADMIN AUTH
 # ============================================================
 ADMIN_KEY = os.getenv("ADMIN_KEY", "")
