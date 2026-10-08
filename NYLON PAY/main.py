@@ -19,25 +19,34 @@ from pydantic import BaseModel as _BaseModel
 from referrals import router as referrals_router
 from withdrawals import router as withdrawals_router
 
+
+# ============================================================
+# CREATE APP + CORS (order is critical)
+# ============================================================
+
 Base.metadata.create_all(bind=engine)
+
 app = FastAPI(title="Subscription API")
+
+# ⚠️ TEMPORARY: allow all origins so the admin panel can reach the API.
+# Once everything works, replace allow_origins with your exact admin URL
+# and set allow_credentials=True.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://bbear-admin.onrender.com",   # your admin site
-        "http://localhost:8000",               # local dev
-        "http://localhost:3000",
-        "http://localhost:5500",
-    ],
-    allow_credentials=True,
+    allow_origins=["*"],
+    allow_credentials=False,          # must be False when origins is ["*"]
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# Routers go AFTER middleware
 app.include_router(referrals_router)
 app.include_router(withdrawals_router)
+
 PLAN_DAYS = 34
-==========================================================
+
+
+# ============================================================
 # ADMIN AUTH
 # ============================================================
 ADMIN_KEY = os.getenv("ADMIN_KEY", "")
@@ -438,7 +447,6 @@ def admin_fail_withdrawal(
     if w.status in ("completed", "failed"):
         raise HTTPException(409, f"Withdrawal already {w.status}")
 
-    # Refund the wallet
     wallet = db.query(Wallet).filter(Wallet.email == w.email).first()
     if wallet:
         wallet.balance_ugx += w.amount_ugx
@@ -460,7 +468,6 @@ def admin_fail_withdrawal(
 def admin_process_batch(db: Session = Depends(get_db)):
     """
     Send all pending withdrawals at once via NylonPay.
-    Good for weekly payout runs.
     """
     from withdrawals import _send_payout_via_nylonpay
 
