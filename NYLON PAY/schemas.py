@@ -12,7 +12,7 @@ class AuthPaymentRequest(BaseModel):
     password: str
     network: str            # "MTN" | "AIRTEL"
     phone: str
-    amount: int = 3000
+    amount: int = 1500
 
 
 class AuthPaymentResponse(BaseModel):
