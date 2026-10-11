@@ -166,7 +166,7 @@ def auth_and_pay(payload: AuthPaymentRequest, db: Session = Depends(get_db)):
 
     # ---- INITIATE PAYMENT ----
     res = initiate(
-        amount=payload.amount or 3000,
+        amount=payload.amount or 1500,
         phone=payload.phone,
         network=payload.network.upper(),
         email=email,
