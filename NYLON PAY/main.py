@@ -6,7 +6,7 @@ from typing import Optional
 import os
 
 from database import Base, engine, get_db
-from models import User, Wallet, Withdrawal
+from models import User, Wallet, Withdrawal,Referral
 from schemas import (
     AuthPaymentRequest, AuthPaymentResponse,
     StatusResponse, MeResponse,
@@ -505,6 +505,48 @@ def admin_process_batch(db: Session = Depends(get_db)):
 # ============================================================
 # ⚠️ DEBUG ENDPOINTS — REMOVE BEFORE PRODUCTION ⚠️
 # ============================================================
+# ============================================================
+# ADMIN: WALLETS + REFERRALS
+# ============================================================
+
+@app.get("/admin/wallets", dependencies=[Depends(require_admin)])
+def admin_list_wallets(db: Session = Depends(get_db)):
+    """All user wallets, sorted by balance descending."""
+    rows = db.query(Wallet).order_by(Wallet.balance_ugx.desc()).all()
+    return [
+        {
+            "id": w.id,
+            "email": w.email,
+            "balance_ugx": w.balance_ugx,
+            "total_earned_ugx": w.total_earned_ugx,
+            "updated_at": w.updated_at.isoformat() if w.updated_at else None,
+        }
+        for w in rows
+    ]
+
+
+@app.get("/admin/referrals", dependencies=[Depends(require_admin)])
+def admin_list_referrals(
+    limit: int = 200,
+    db: Session = Depends(get_db),
+):
+    """All referral events, newest first."""
+    rows = (
+        db.query(Referral)
+        .order_by(Referral.created_at.desc())
+        .limit(limit)
+        .all()
+    )
+    return [
+        {
+            "id": r.id,
+            "referrer_email": r.referrer_email,
+            "referred_email": r.referred_email,
+            "amount_ugx": r.amount_ugx,
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+        }
+        for r in rows
+    ]
 
 @app.get("/debug/users")
 def debug_users(db: Session = Depends(get_db)):
